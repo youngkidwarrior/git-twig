@@ -9,15 +9,16 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 use tree::{Entry, Kind};
 
 /// Execute supported creation requests natively; delegate everything else to Git.
 pub fn run(cwd: &Path, args: &[OsString]) -> Result<i32> {
     ensure!(
-        !args.first().is_some_and(|arg| arg == "add"),
+        args.first().is_none_or(|arg| arg != "add"),
         "\'add\' has been removed; use \'git twig new\'"
     );
     // Both native preparation and fallback consume Git worktree arguments.
@@ -120,6 +121,8 @@ fn prepare(
         "GIT_INDEX_FILE",
         "GIT_OBJECT_DIRECTORY",
         "GIT_COMMON_DIR",
+        "GIT_ATTR_SOURCE",
+        "GIT_CONFIG",
     ] {
         if env::var_os(key).is_some() {
             return Ok(None);
@@ -193,9 +196,9 @@ fn prepare(
     {
         return Ok(None);
     }
-    if has_conversion_attributes(&root, &entries)? {
+    let Some(auto_lf) = checkout_attributes(&root, &commit, &entries)? else {
         return Ok(None);
-    }
+    };
     let stage = staging.create(&root, &parent)?;
     let data = stage.join("data");
     fs::create_dir(&data)?;
@@ -205,6 +208,7 @@ fn prepare(
     trace(&format!("APFS directory clones: {directories}"));
     #[cfg(not(target_os = "macos"))]
     let _ = directories;
+    verify_raw_blobs(&root, &data, &entries, auto_lf)?;
     verify(&root, &data, &stage.join("index"), &commit)?;
     Ok(Some(Prepared {
         root,
@@ -336,53 +340,192 @@ fn finish_install(prepared: &Prepared) -> Result<()> {
     Ok(())
 }
 
-fn has_conversion_attributes(root: &Path, entries: &[Entry]) -> Result<bool> {
-    use std::io::Write;
-    use std::process::Stdio;
+fn checkout_attributes(root: &Path, commit: &str, entries: &[Entry]) -> Result<Option<bool>> {
+    if !checkout_config_is_stable(root)? {
+        return Ok(None);
+    }
+    let mut input = Vec::new();
+    for entry in entries {
+        let name = entry.path.file_name().expect("parsed tree path has a name");
+        // Case-insensitive filesystems can resolve names Git's tree lookup would miss.
+        if name.eq_ignore_ascii_case(".gitattributes")
+            && (name != ".gitattributes" || !matches!(entry.kind, Kind::File { .. }))
+        {
+            return Ok(None);
+        }
+        input.extend(native::path_bytes(&entry.path));
+        input.push(0);
+    }
     let mut command = git(root);
-    command
+    command.args(["check-attr", "-z", "--stdin", "--all"]);
+    let mut auto_lf = false;
+    for source in [None, Some(commit)] {
+        if let Some(commit) = source {
+            command.args(["--source", commit]);
+        }
+        let output = git_with_input(&mut command, &input)?;
+        let mut fields: Vec<_> = output.split(|byte| *byte == 0).collect();
+        ensure!(
+            fields.pop() == Some(b"".as_slice()),
+            "unterminated Git attributes"
+        );
+        let (records, remainder) = fields.as_chunks::<3>();
+        ensure!(remainder.is_empty(), "incomplete Git attribute record");
+        for path in records.chunk_by(|a, b| a[0] == b[0]) {
+            let text = path
+                .iter()
+                .any(|row| row[1] == b"text" && row[2] == b"auto");
+            let eol = path.iter().any(|row| row[1] == b"eol" && row[2] == b"lf");
+            if text != eol || has_conversion_attributes(path) {
+                return Ok(None);
+            }
+            auto_lf |= text;
+        }
+    }
+    Ok(Some(auto_lf))
+}
+
+fn has_conversion_attributes(attributes: &[[&[u8]; 3]]) -> bool {
+    attributes
+        .iter()
+        .any(|[_, name, value]| match (*name, *value) {
+            // --all omits unspecified attributes. A literal filter name can still
+            // look like Git's "unset" output, so defer either form to Git.
+            (b"filter" | b"working-tree-encoding", _) => true,
+            (b"ident" | b"crlf" | b"text" | b"eol", b"unset")
+            | (b"text", b"auto")
+            | (b"eol", b"lf") => false,
+            (b"ident" | b"crlf" | b"text" | b"eol", _) => true,
+            _ => false,
+        })
+}
+
+fn checkout_config_is_stable(root: &Path) -> Result<bool> {
+    // Git resolves relative config and attribute files from its checkout cwd.
+    if [
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "HOME",
+        "XDG_CONFIG_HOME",
+    ]
+    .iter()
+    .filter_map(env::var_os)
+    .any(|path| !path.is_empty() && !Path::new(&path).is_absolute())
+    {
+        return Ok(false);
+    }
+
+    // Includes can become active after registration. A copied config.worktree
+    // can resolve includes from a different Git directory.
+    let config = git(root)
         .args([
-            "check-attr",
-            "-z",
-            "--stdin",
-            "filter",
-            "working-tree-encoding",
-            "ident",
-            "text",
-            "eol",
-            "crlf",
+            "config",
+            "--includes",
+            "--null",
+            "--type=path",
+            "--get-regexp",
+            r"^(includeif\..*\.path|extensions\.worktreeconfig|core\.attributesfile)$",
         ])
+        .output()?;
+    if config.status.code() == Some(1) {
+        return Ok(true);
+    }
+    let Some(records) = config.stdout.strip_suffix(b"\0") else {
+        return Ok(false);
+    };
+    let mut attributes_file = None;
+    for record in records.split(|byte| *byte == 0) {
+        let Some(path) = record.strip_prefix(b"core.attributesfile\n") else {
+            return Ok(false);
+        };
+        attributes_file = Some(path);
+    }
+    Ok(config.status.success()
+        && attributes_file
+            .is_some_and(|path| Path::new(&native::os_string(path.to_vec())).is_absolute()))
+}
+
+fn verify_raw_blobs(root: &Path, data: &Path, entries: &[Entry], auto_lf: bool) -> Result<()> {
+    // eol=lf leaves committed bytes unchanged at checkout. Git's clean
+    // conversion can hide a CRLF copy, so bypass filters when comparing.
+    let files = || {
+        entries.iter().filter(|entry| {
+            matches!(entry.kind, Kind::File { .. })
+                && (auto_lf
+                    || entry
+                        .path
+                        .file_name()
+                        .is_some_and(|name| name == ".gitattributes"))
+        })
+    };
+    let mut input = Vec::new();
+    for entry in files() {
+        quote_hash_path(&data.join(&entry.path), &mut input);
+    }
+    if input.is_empty() {
+        return Ok(());
+    }
+    let output = git_with_input(
+        git(root).args(["hash-object", "--no-filters", "--stdin-paths"]),
+        &input,
+    )?;
+    let mut hashes = output
+        .strip_suffix(b"\n")
+        .context("unterminated Git blob hashes")?
+        .split(|byte| *byte == b'\n');
+    for entry in files() {
+        ensure!(
+            hashes.next() == Some(entry.object_id.as_bytes()),
+            "cloned bytes do not match the committed blob: {}",
+            entry.path.display()
+        );
+    }
+    ensure!(
+        hashes.next().is_none(),
+        "Git reported an unexpected blob hash"
+    );
+    Ok(())
+}
+
+fn quote_hash_path(path: &Path, input: &mut Vec<u8>) {
+    // hash-object --stdin-paths accepts Git's C-quoted paths, one per line.
+    input.push(b'"');
+    for byte in native::path_bytes(path) {
+        match byte {
+            b'\\' | b'"' => input.extend_from_slice(&[b'\\', byte]),
+            b' '..=b'~' => input.push(byte),
+            _ => input.extend_from_slice(&[
+                b'\\',
+                b'0' + (byte >> 6),
+                b'0' + ((byte >> 3) & 7),
+                b'0' + (byte & 7),
+            ]),
+        }
+    }
+    input.extend_from_slice(b"\"\n");
+}
+
+fn git_with_input(command: &mut Command, input: &[u8]) -> Result<Vec<u8>> {
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let input: Vec<u8> = entries
-        .iter()
-        .flat_map(|entry| {
-            let mut bytes = native::path_bytes(&entry.path);
-            bytes.push(0);
-            bytes
-        })
-        .collect();
-    // Drain stdout concurrently: attribute output can exceed pipe capacity before stdin is consumed.
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("cannot execute Git")?;
+    // Drain output concurrently so a full pipe cannot deadlock the writer.
     let mut stdin = child.stdin.take().context("missing Git stdin")?;
-    let writer = std::thread::spawn(move || stdin.write_all(&input));
-    let result = child.wait_with_output()?;
-    writer
-        .join()
-        .map_err(|_| anyhow::anyhow!("attribute writer panicked"))??;
-    ensure!(result.status.success(), "git check-attr failed");
-    let fields: Vec<_> = result
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .collect();
-    ensure!(fields.len() % 3 == 0, "invalid Git attribute response");
-    Ok(fields
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .any(|row| row[2] != b"unspecified" && row[2] != b"unset"))
+    let (output, written) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(input));
+        (child.wait_with_output(), writer.join())
+    });
+    let output = output?;
+    ensure!(
+        output.status.success(),
+        "Git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    written.map_err(|_| anyhow::anyhow!("Git input writer panicked"))??;
+    Ok(output.stdout)
 }
 
 fn config_true(root: &Path, key: &str) -> bool {

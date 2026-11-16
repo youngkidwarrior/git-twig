@@ -19,9 +19,9 @@ inherit source permission restrictions or special modes. The tracked Linux walk
 establishes file types, inventory and checkout modes in one pass; do not run the
 APFS subtree-pruning pass over its completed output.
 
-Delegate core.symlinks=false and all conversion attributes, including legacy crlf.
-Hash equality after Git clean conversion is not proof of checkout-byte equality.
-The reference and regression checks must compare raw bytes and entry types.
+Delegate `core.symlinks=false` and unsupported conversions, including legacy `crlf`.
+Use the same [attribute and byte verification](RFD0001-verified-cow-worktrees.md#reference-and-invariants)
+as on macOS. The reference and regression checks compare raw bytes and entry types.
 
 Reference-transaction hooks run inside branch registration; post-index-change hooks
 can run while initializing the index. Both are inside the native registration lock.

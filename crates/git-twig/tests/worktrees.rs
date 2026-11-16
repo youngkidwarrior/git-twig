@@ -1039,6 +1039,314 @@ fn empty_initial_commit_creates_a_clean_empty_worktree() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn auto_lf_preserves_committed_text_and_binary_bytes_natively() -> Result<()> {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let f = Fixture::with_object_format("sha256")?;
+    let weird_name = Path::new(OsStr::from_bytes(if cfg!(target_os = "macos") {
+        b"tree/odd\tname\n\".bin"
+    } else {
+        b"tree/odd\tname\n\"\xff.bin"
+    }));
+    let binary = b"first\0\r\nsecond\n";
+    fs::create_dir(f.source.join("tree"))?;
+    fs::write(f.source.join(weird_name), binary)?;
+    fs::write(f.source.join("tree/.gitattributes"), "*.bin eol=lf\n")?;
+    fs::write(f.source.join("tree/reset.txt"), "reset\n")?;
+    fs::write(f.source.join("tree/unset.txt"), "unset\n")?;
+    git(&f.source, &["config", "core.eol", "crlf"])?;
+    commit_attributes(
+        &f,
+        "[attr]lf text=auto eol=lf\n* lf\ntree/*.bin !eol\n\
+         tree/reset.txt !text !eol\ntree/unset.txt -text -eol\n",
+    )?;
+
+    let output = checked(f.add()?)?;
+    native(&output);
+    #[cfg(target_os = "linux")]
+    if linux_reflinks_available(&f)? {
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Linux reflink CoW: verified"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(fs::read(f.destination().join("hello.txt"))?, b"hello\n");
+    assert_eq!(fs::read(f.destination().join(weird_name))?, binary);
+    assert_eq!(
+        fs::read(f.destination().join("tree/reset.txt"))?,
+        b"reset\n"
+    );
+    assert_eq!(
+        fs::read(f.destination().join("tree/unset.txt"))?,
+        b"unset\n"
+    );
+    clean(&f.destination())?;
+    fs::write(f.destination().join(weird_name), b"private")?;
+    assert_eq!(fs::read(f.source.join(weird_name))?, binary);
+    Ok(())
+}
+
+#[test]
+fn auto_lf_delegates_when_git_clean_source_bytes_differ_from_blob() -> Result<()> {
+    let f = Fixture::new()?;
+    fs::create_dir(f.source.join("tree"))?;
+    fs::write(f.source.join("tree/file.txt"), "hello\n")?;
+    commit_attributes(&f, "*.txt text=auto eol=lf\n")?;
+    let dirty_path = "tree/file.txt";
+    fs::write(f.source.join(dirty_path), "hello\r\n")?;
+    assert_eq!(
+        git(&f.source, &["hash-object", dirty_path])?.stdout,
+        git(&f.source, &["rev-parse", "HEAD:tree/file.txt"])?.stdout
+    );
+
+    let output = checked(f.add()?)?;
+    let trace = String::from_utf8_lossy(&output.stderr);
+    assert!(trace.contains("stock Git:"), "{trace}");
+    #[cfg(target_os = "linux")]
+    let reflinks = linux_reflinks_available(&f)?;
+    #[cfg(not(target_os = "linux"))]
+    let reflinks = cfg!(target_os = "macos");
+    if reflinks {
+        assert!(
+            trace
+                .contains("stock Git: cloned bytes do not match the committed blob: tree/file.txt"),
+            "{trace}"
+        );
+    }
+    assert_eq!(fs::read(f.destination().join(dirty_path))?, b"hello\n");
+    assert_eq!(fs::read(f.source.join(dirty_path))?, b"hello\r\n");
+    clean(&f.destination())
+}
+
+#[test]
+fn auto_lf_checkout_matches_git_when_history_contains_crlf() -> Result<()> {
+    let f = Fixture::new()?;
+    let historical = b"first\r\nsecond\n";
+    fs::write(f.source.join("hello.txt"), historical)?;
+    git(&f.source, &["add", "hello.txt"])?;
+    fs::write(f.source.join(".gitattributes"), "*.txt text=auto eol=lf\n")?;
+    git(&f.source, &["add", ".gitattributes"])?;
+    git(&f.source, &["commit", "-m", "retain historical CRLF blob"])?;
+    assert_eq!(
+        git(&f.source, &["show", "HEAD:hello.txt"])?.stdout,
+        historical
+    );
+    git(
+        &f.source,
+        &["worktree", "add", "--detach", "../stock", "HEAD"],
+    )?;
+
+    let output = checked(f.add()?)?;
+    native(&output);
+    assert_eq!(
+        fs::read(f.destination().join("hello.txt"))?,
+        fs::read(f.root.join("stock/hello.txt"))?
+    );
+    clean(&f.destination())
+}
+
+#[test]
+fn auto_lf_attributes_must_apply_to_the_same_path() -> Result<()> {
+    let f = Fixture::new()?;
+    git(&f.source, &["config", "core.eol", "crlf"])?;
+    commit_attributes(&f, "*.txt text=auto\n.gitignore eol=lf\n")?;
+
+    let output = checked(f.add()?)?;
+    assert!(String::from_utf8_lossy(&output.stderr).contains("stock Git:"));
+    assert_eq!(fs::read(f.destination().join("hello.txt"))?, b"hello\r\n");
+    assert_eq!(fs::read(f.source.join("hello.txt"))?, b"hello\n");
+    clean(&f.destination())
+}
+
+#[test]
+fn auto_lf_does_not_allow_ident_expansion() -> Result<()> {
+    let f = Fixture::new()?;
+    fs::write(f.source.join("hello.txt"), "$Id$\n")?;
+    commit_attributes(&f, "*.txt text=auto eol=lf ident\n")?;
+    assert_destination_ident(&f, &f.destination(), f.add()?)
+}
+
+#[test]
+fn auto_lf_delegates_for_named_filters() -> Result<()> {
+    for driver in ["prefix", "unset", "unspecified"] {
+        let f = Fixture::new()?;
+        git(
+            &f.source,
+            &[
+                "config",
+                &format!("filter.{driver}.smudge"),
+                "sed 's/^/prefix: /'",
+            ],
+        )?;
+        git(
+            &f.source,
+            &[
+                "config",
+                &format!("filter.{driver}.clean"),
+                "sed 's/^prefix: //'",
+            ],
+        )?;
+        commit_attributes(&f, &format!("*.txt text=auto eol=lf filter={driver}\n"))?;
+
+        let output = checked(f.add()?)?;
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("stock Git:"),
+            "{driver}"
+        );
+        assert_eq!(
+            fs::read(f.destination().join("hello.txt"))?,
+            b"prefix: hello\n",
+            "{driver}"
+        );
+        assert_eq!(fs::read(f.source.join("hello.txt"))?, b"hello\n");
+        clean(&f.destination())?;
+    }
+    Ok(())
+}
+
+fn commit_attributes(f: &Fixture, rules: &str) -> Result<()> {
+    fs::write(f.source.join(".gitattributes"), rules)?;
+    git(&f.source, &["add", "."])?;
+    git(&f.source, &["commit", "-m", "checkout attributes"])?;
+    Ok(())
+}
+
+fn auto_lf_ident_fixture() -> Result<Fixture> {
+    let f = Fixture::new()?;
+    fs::write(f.source.join("hello.txt"), "$Id$\n")?;
+    commit_attributes(&f, "*.txt text=auto eol=lf\n")?;
+    fs::write(f.root.join("ident.attrs"), "*.txt ident\n")?;
+    let attributes = f.root.join("ident.attrs");
+    git(
+        &f.source,
+        &[
+            "config",
+            "--file",
+            "../ident.cfg",
+            "core.attributesFile",
+            attributes.to_str().expect("fixture path is UTF-8"),
+        ],
+    )?;
+    Ok(f)
+}
+
+fn assert_destination_ident(f: &Fixture, destination: &Path, output: Output) -> Result<()> {
+    let output = checked(output)?;
+    let blob = git(&f.source, &["rev-parse", "HEAD:hello.txt"])?.stdout;
+    let expanded = format!("$Id: {} $\n", String::from_utf8(blob)?.trim_end());
+    let trace = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        fs::read_to_string(destination.join("hello.txt"))?,
+        expanded,
+        "{trace}"
+    );
+    assert!(trace.contains("stock Git:"), "{trace}");
+    assert_eq!(fs::read(f.source.join("hello.txt"))?, b"$Id$\n");
+    clean(destination)
+}
+
+#[test]
+fn auto_lf_delegates_for_branch_conditional_config() -> Result<()> {
+    let f = auto_lf_ident_fixture()?;
+    git(
+        &f.source,
+        &[
+            "config",
+            "--file",
+            ".git/included.cfg",
+            "includeIf.onbranch:feature.path",
+            "../../ident.cfg",
+        ],
+    )?;
+    git(&f.source, &["config", "include.path", "included.cfg"])?;
+    assert_destination_ident(&f, &f.destination(), f.add()?)
+}
+
+#[test]
+fn auto_lf_delegates_for_gitdir_conditional_config() -> Result<()> {
+    let f = auto_lf_ident_fixture()?;
+    let key = format!(
+        "includeIf.gitdir:{}/.git/worktrees/.path",
+        f.source.display()
+    );
+    git(&f.source, &["config", &key, "../../ident.cfg"])?;
+    let output = f.twig(&["new", "--detach", "../feature"])?;
+    assert_destination_ident(&f, &f.destination(), output)
+}
+
+#[test]
+fn auto_lf_delegates_for_relative_attributes_file() -> Result<()> {
+    let f = auto_lf_ident_fixture()?;
+    fs::create_dir(f.destination())?;
+    fs::copy(
+        f.root.join("ident.attrs"),
+        f.destination().join("ident.attrs"),
+    )?;
+    fs::write(f.root.join("ident.attrs"), "")?;
+    git(
+        &f.source,
+        &["config", "core.attributesFile", "../ident.attrs"],
+    )?;
+    let destination = f.destination().join("checkout");
+    let output = f.twig(&["new", "--detach", "../feature/checkout"])?;
+    assert_destination_ident(&f, &destination, output)
+}
+
+#[test]
+fn auto_lf_delegates_for_worktree_config_includes() -> Result<()> {
+    let f = auto_lf_ident_fixture()?;
+    git(&f.source, &["config", "include.path", "../../ident.cfg"])?;
+    git(&f.source, &["config", "extensions.worktreeConfig", "true"])?;
+    let empty = f.root.join("empty.attrs");
+    fs::write(&empty, "")?;
+    git(
+        &f.source,
+        &[
+            "config",
+            "--file",
+            ".git/override.cfg",
+            "core.attributesFile",
+            empty.to_str().expect("fixture path is UTF-8"),
+        ],
+    )?;
+    git(
+        &f.source,
+        &["config", "--worktree", "include.path", "override.cfg"],
+    )?;
+    assert_destination_ident(&f, &f.destination(), f.add()?)
+}
+
+#[test]
+fn auto_lf_delegates_when_only_one_attribute_source_is_supported() -> Result<()> {
+    let unsupported = "*.txt text=auto eol=crlf\n";
+    let supported = "*.txt text=auto eol=lf\n";
+    for (committed, working, expected) in [
+        (unsupported, supported, b"hello\r\n".as_slice()),
+        (supported, unsupported, b"hello\n".as_slice()),
+    ] {
+        let f = Fixture::new()?;
+        fs::create_dir(f.source.join("tree"))?;
+        fs::write(f.source.join("tree/hello.txt"), "hello\n")?;
+        let attributes = f.source.join("tree/.gitattributes");
+        fs::write(&attributes, committed)?;
+        commit_attributes(&f, supported)?;
+        fs::write(&attributes, working)?;
+
+        let output = checked(f.add()?)?;
+        let trace = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            trace.contains("stock Git: request is outside the CoW fast path"),
+            "{trace}"
+        );
+        assert_eq!(fs::read(f.destination().join("tree/hello.txt"))?, expected);
+        assert_eq!(fs::read(&attributes)?, working.as_bytes());
+        clean(&f.destination())?;
+    }
+    Ok(())
+}
+
 #[test]
 fn line_ending_conversions_delegate() -> Result<()> {
     let f = Fixture::new()?;

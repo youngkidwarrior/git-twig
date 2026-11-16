@@ -12,6 +12,7 @@ pub enum Kind {
 pub struct Entry {
     pub path: PathBuf,
     pub kind: Kind,
+    pub object_id: String,
 }
 
 pub fn parse(bytes: &[u8]) -> Result<Vec<Entry>> {
@@ -28,7 +29,9 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Entry>> {
                 .position(|byte| *byte == b'\t')
                 .context("missing tree separator")?;
             let header = std::str::from_utf8(&record[..separator])?;
-            let mode = header.split(' ').next().context("missing tree mode")?;
+            let mut fields = header.splitn(3, ' ');
+            let mode = fields.next().context("missing tree mode")?;
+            let object_id = fields.nth(1).context("missing tree object ID")?;
             let kind = match mode {
                 "100644" => Kind::File { executable: false },
                 "100755" => Kind::File { executable: true },
@@ -40,7 +43,11 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Entry>> {
             ensure!(!path.as_os_str().is_empty() && path.components().all(|part|
             matches!(part, Component::Normal(name) if !name.eq_ignore_ascii_case(".git"))),
             "unsafe tree path: {}", path.display());
-            Ok(Entry { path, kind })
+            Ok(Entry {
+                path,
+                kind,
+                object_id: object_id.into(),
+            })
         })
         .collect()
 }

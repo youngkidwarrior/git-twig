@@ -20,10 +20,16 @@ CoW was used. On unsupported platforms Git remains the implementation.
 
 Parse the supported argument subset before effects. Resolve source HEAD and the
 target commit; optimize only when equal. Enumerate target tracked entries, reject
-submodules/sparse layouts and custom conversion attributes, and clone into a
+submodules/sparse layouts and unsupported conversion attributes, and clone into a
 private staging directory on the destination filesystem. Never copy .git,
 untracked files, ignored outputs or a source index. Never hardlink to source.
 Check ancestors without following symlinks.
+
+Check attributes in both the source and the pinned commit. Delegate conditional
+includes, worktree-specific configuration, and checkout-relative config or
+attribute paths to Git. Compare staged attribute files and, when `text=auto eol=lf`
+applies, all staged regular files with their committed blob IDs without filters.
+Git preserves these bytes at checkout, including historical CRLF and binary blobs.
 
 Create a fresh temporary index from the pinned commit, then ask Git to hash-compare
 the staged files against it with stat caches and fsmonitor disabled. A dirty or

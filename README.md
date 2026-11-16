@@ -34,7 +34,8 @@ For coding agents: `git twig skill` prints the bundled skill.
 Native CoW supports macOS/APFS and Linux on Btrfs or reflink-enabled XFS.
 Creates ordinary linked worktrees from committed files; local changes and ignored
 files aren't copied. Unsupported filesystems (including typical ext4), options and
-checkout semantics use `git worktree`. Set `TWIG_TRACE=1` to see backend selection.
+checkout semantics use `git worktree`. Native CoW can verify `text=auto eol=lf`
+checkouts with stable Git configuration. Set `TWIG_TRACE=1` to see backend selection.
 
 Source, destination and Git metadata must share a clone-capable filesystem for
 native CoW. Twig verifies cloned files against the requested commit; writes are
