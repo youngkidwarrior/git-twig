@@ -126,6 +126,8 @@ fn prepare(cwd: &Path, request: &AddRequest, staging: &mut staging::Staging) -> 
         "GIT_COMMON_DIR",
         "GIT_ATTR_SOURCE",
         "GIT_REPLACE_REF_BASE",
+        // git config honors this override, but checkout commands do not.
+        "GIT_CONFIG",
     ] {
         ensure!(
             env::var_os(key).is_none(),
