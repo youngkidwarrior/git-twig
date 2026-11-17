@@ -5,6 +5,32 @@ use std::io::Write;
 const LF: &[u8] = b"hello\n";
 const CRLF: &[u8] = b"hello\r\n";
 
+#[test]
+fn config_command_override_does_not_hide_checkout_policy() -> Result<()> {
+    let f = Fixture::new()?;
+    fs::write(f.source.join(".gitattributes"), "*.txt text\n")?;
+    git(&f.source, &["add", ".gitattributes"])?;
+    git(&f.source, &["commit", "-m", "text checkout policy"])?;
+    git(&f.source, &["config", "core.eol", "crlf"])?;
+    checked(
+        command("git", &f.source)
+            .env("GIT_CONFIG", "/dev/null")
+            .args(["worktree", "add", "--detach", "../stock", "HEAD"])
+            .output()?,
+    )?;
+    checked(
+        command(env!("CARGO_BIN_EXE_git-twig"), &f.source)
+            .env("GIT_CONFIG", "/dev/null")
+            .args(["new", "-b", "feature", "../feature", "HEAD"])
+            .output()?,
+    )?;
+    let expected = fs::read(f.root.join("stock/hello.txt"))?;
+    assert_eq!(expected, CRLF);
+    assert_eq!(fs::read(f.destination().join("hello.txt"))?, expected);
+    assert_eq!(fs::read(f.source.join("hello.txt"))?, LF);
+    Ok(())
+}
+
 struct Case {
     name: &'static str,
     attributes: &'static str,
